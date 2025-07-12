@@ -1,23 +1,31 @@
 <?php
-#PHP 5.3+ and PHP 7.0
-// 启用错误显示以便调试（生产环境中应移除）
-#ini_set('display_errors', 1);
-#ini_set('display_startup_errors', 1);
-#error_reporting(E_ALL);
+#PHP 7.0 +
 
-// 配置项
-define('UPSTREAM_DNS', 'https://1.1.1.1/dns-query'); // 上游DNS服务器
-define('DOH_PATH', '/doh.php'); // 预期访问路径
-$ALLOWED_METHODS = array('GET', 'POST'); // 支持的方法（兼容旧PHP版本）
+define('UPSTREAM_DNS', 'https://dns.google/dns-query'); // 上游DNS服务器（Google DoH）
+$ALLOWED_METHODS = array('GET', 'POST'); // 支持的方法
 
-// 调试头：确认脚本是否执行
-header('X-DOH-Debug: Script-Executed');
+// MySQL数据库配置
+define('DB_HOST', 'localhost');
+define('DB_USER', 'your_username');
+define('DB_PASS', 'your_password');
+define('DB_NAME', 'dns_cache');
 
-// 检查是否以/doh.php结尾
+define('DB_TABLE_IPV4', 'dns_records_ipv4');
+define('DB_TABLE_IPV6', 'dns_records_ipv6');
+
+// 确保使用HTTPS
+if (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on') {
+    header('HTTP/1.1 403 Forbidden');
+    exit('HTTPS is required for DoH');
+}
+
+// 获取当前脚本文件名
+$script_name = basename($_SERVER['SCRIPT_NAME']);
 $request_uri = $_SERVER['REQUEST_URI'];
 $uri_path = parse_url($request_uri, PHP_URL_PATH);
-header('X-DOH-Request-URI: ' . $request_uri); // 调试：返回实际请求URI
-if ($uri_path !== DOH_PATH && substr($uri_path, -strlen(DOH_PATH)) !== DOH_PATH) {
+
+// 检查请求路径是否匹配当前脚本文件名
+if ($uri_path !== '/' . $script_name && substr($uri_path, -strlen($script_name) - 1) !== '/' . $script_name) {
     header('HTTP/1.1 404 Not Found');
     exit('404 Not Found');
 }
@@ -55,31 +63,177 @@ if (empty($dns_query) || $dns_query === false) {
     exit('Empty or Invalid DNS Query');
 }
 
-// 初始化cURL
+// 连接到 MySQL 8.0 数据库
+try {
+    $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8';
+    $pdo = new PDO($dsn, DB_USER, DB_PASS, array(
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ));
+    $pdo->exec('SET SESSION sql_mode = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"');
+} catch (PDOException $e) {
+    error_log('Database Connection Failed: ' . $e->getMessage());
+    header('HTTP/1.1 500 Internal Server Error');
+    exit('Database Connection Failed');
+}
+
+// 从DNS查询数据中提取域名和查询类型
+$domain = '';
+$pos = 12; // 跳过DNS头部（12字节）
+$domain_parts = array();
+while ($pos < strlen($dns_query) && ord($dns_query[$pos]) !== 0) {
+    $len = ord($dns_query[$pos]);
+    $pos++;
+    if ($len > 0) {
+        $domain_parts[] = substr($dns_query, $pos, $len);
+        $pos += $len;
+    }
+}
+$domain = implode('.', $domain_parts);
+$qtype = unpack('n', substr($dns_query, $pos + 2, 2))[1]; // 查询类型（1=A, 28=AAAA）
+
+// 检查数据库中是否有DNS记录
+$ips = array('ipv4' => null, 'ipv6' => null);
+
+// 查询IPv4
+if ($qtype == 1 || $qtype == 255) { // A记录或ANY
+    $stmt = $pdo->prepare('SELECT ipv4 FROM ' . DB_TABLE_IPV4 . ' WHERE domain = ?');
+    $stmt->execute(array($domain));
+    $cached = $stmt->fetch();
+    if ($cached) {
+        $ips['ipv4'] = $cached['ipv4'];
+    }
+}
+
+// 查询IPv6
+if ($qtype == 28 || $qtype == 255) { // AAAA记录或ANY
+    $stmt = $pdo->prepare('SELECT ipv6 FROM ' . DB_TABLE_IPV6 . ' WHERE domain = ?');
+    $stmt->execute(array($domain));
+    $cached = $stmt->fetch();
+    if ($cached) {
+        $ips['ipv6'] = $cached['ipv6'];
+    }
+}
+
+// 缓存命中：构建DNS响应
+if ($ips['ipv4'] || $ips['ipv6']) {
+    $response = $dns_query; // 复制查询头部
+    $response[2] = "\x81\x80"; // 设置响应标志（QR=1）
+    $answer_count = ($ips['ipv4'] ? 1 : 0) + ($ips['ipv6'] ? 1 : 0);
+    $response[6] = pack('n', $answer_count); // Answer RRs
+    $response[8] = "\x00\x00"; // Authority RRs = 0
+    $response[10] = "\x00\x00"; // Additional RRs = 0
+    $answer = '';
+    if ($ips['ipv4']) {
+        $answer .= "\xc0\x0c"; // 指向查询中的域名
+        $answer .= "\x00\x01"; // 类型 A
+        $answer .= "\x00\x01"; // 类 IN
+        $answer .= "\x00\x00\x0e\x10"; // TTL 3600秒
+        $answer .= "\x00\x04"; // 数据长度 4字节
+        $answer .= inet_pton($ips['ipv4']); // IPv4地址
+    }
+    if ($ips['ipv6']) {
+        $answer .= "\xc0\x0c"; // 指向查询中的域名
+        $answer .= "\x00\x1c"; // 类型 AAAA
+        $answer .= "\x00\x01"; // 类 IN
+        $answer .= "\x00\x00\x0e\x10"; // TTL 3600秒
+        $answer .= "\x00\x10"; // 数据长度 16字节
+        $answer .= inet_pton($ips['ipv6']); // IPv6地址
+    }
+    $response .= $answer;
+
+    header('Content-Type: application/dns-message');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Content-Length: ' . strlen($response));
+    echo $response;
+    exit;
+}
+
+// 初始化cURL查询上游DNS
 $ch = curl_init();
 curl_setopt_array($ch, array(
     CURLOPT_URL => UPSTREAM_DNS,
-    CURLOPT_POST => true,
+    CURLOPT_POST => 1,
     CURLOPT_POSTFIELDS => $dns_query,
-    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_RETURNTRANSFER => 1,
     CURLOPT_HTTPHEADER => array(
         'Content-Type: application/dns-message',
         'Accept: application/dns-message'
     ),
     CURLOPT_TIMEOUT => 5,
-    CURLOPT_SSL_VERIFYPEER => true,
-    CURLOPT_SSL_VERIFYHOST => 2
+    CURLOPT_SSL_VERIFYPEER => 1,
+    CURLOPT_SSL_VERIFYHOST => 2,
+    CURLOPT_PROTOCOLS => CURLPROTO_HTTPS
 ));
 
-// 执行请求
+// 执行上游DNS请求
 $response = curl_exec($ch);
 $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-// 处理响应
+// 处理上游DNS响应
 if ($response === false || $http_code !== 200) {
+    error_log('Upstream DNS Error for domain: ' . $domain . ', HTTP code: ' . $http_code);
     header('HTTP/1.1 502 Bad Gateway');
     exit('Upstream DNS Error');
+}
+
+// 解析DNS响应以提取IP地址（只取第一个A和AAAA记录）
+$ipv4 = null;
+$ipv6 = null;
+$offset = 12; // 跳过头部
+$offset += strlen($domain) + 2 + 4; // 跳过QNAME、QTYPE、QCLASS
+$answer_count = unpack('n', substr($response, 6, 2))[1]; // 获取答案数量
+if ($answer_count > 0) {
+    while ($offset < strlen($response)) {
+        if (ord($response[$offset]) >= 192) { // 压缩指针
+            $offset += 2;
+        } else {
+            while (ord($response[$offset]) !== 0) {
+                $offset += ord($response[$offset]) + 1;
+            }
+            $offset++;
+        }
+        $type = unpack('n', substr($response, $offset, 2))[1];
+        $offset += 4; // 跳过TYPE和CLASS
+        $ttl = unpack('N', substr($response, $offset, 4))[1];
+        $offset += 4;
+        $data_len = unpack('n', substr($response, $offset, 2))[1];
+        $offset += 2;
+        if ($type == 1 && $data_len == 4 && $ipv4 === null) { // A记录，IPv4
+            $ipv4 = inet_ntop(substr($response, $offset, 4));
+        } elseif ($type == 28 && $data_len == 16 && $ipv6 === null) { // AAAA记录，IPv6
+            $ipv6 = inet_ntop(substr($response, $offset, 16));
+        }
+        $offset += $data_len;
+        // 仅提取第一个IPv4和IPv6记录
+        if ($ipv4 !== null && $ipv6 !== null) {
+            break;
+        }
+    }
+}
+
+// 将DNS结果插入数据库（仅INSERT，不修改）
+try {
+    if ($ipv4 && $ips['ipv4'] === null) {
+        $stmt = $pdo->prepare('SELECT COUNT(*) FROM ' . DB_TABLE_IPV4 . ' WHERE domain = ?');
+        $stmt->execute(array($domain));
+        if ($stmt->fetchColumn() == 0) {
+            $stmt = $pdo->prepare('INSERT INTO ' . DB_TABLE_IPV4 . ' (domain, ipv4, timestamp) VALUES (?, ?, ?)');
+            $stmt->execute(array($domain, $ipv4, time()));
+        }
+    }
+    if ($ipv6 && $ips['ipv6'] === null) {
+        $stmt = $pdo->prepare('SELECT COUNT(*) FROM ' . DB_TABLE_IPV6 . ' WHERE domain = ?');
+        $stmt->execute(array($domain));
+        if ($stmt->fetchColumn() == 0) {
+            $stmt = $pdo->prepare('INSERT INTO ' . DB_TABLE_IPV6 . ' (domain, ipv6, timestamp) VALUES (?, ?, ?)');
+            $stmt->execute(array($domain, $ipv6, time()));
+        }
+    }
+} catch (PDOException $e) {
+    error_log('Failed to insert DNS response to database: ' . $e->getMessage());
 }
 
 // 设置响应头 (RFC8484)
@@ -87,7 +241,6 @@ header('Content-Type: application/dns-message');
 header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Content-Length: ' . strlen($response));
 
-// 输出响应
+// 输出完整DNS响应
 echo $response;
-
 ?>
