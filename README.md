@@ -1,130 +1,159 @@
-# doh_server
-DNS-over-HTTPS (DoH) Service
-This project implements a DNS-over-HTTPS (DoH) service using PHP, compliant with RFC8484. It forwards DNS queries to an upstream DoH server (default: Cloudflare's 1.1.1.1) and supports both GET and POST methods. The service is accessible via a specific endpoint (/doh.php) and is designed for secure, privacy-focused DNS resolution.
+DoH DNS Server
+A PHP-based DNS over HTTPS (DoH) server that queries DNS records via Google DoH and caches results in a MySQL database. It supports manual updates of IPv4 and IPv6 records for specified domains without adding or deleting records.
 Features
 
-RFC8484 Compliance: Supports GET and POST requests with application/dns-message Content-Type.
-Custom Endpoint: Accessible only via /doh.php.
-Upstream DNS: Configurable upstream DoH server (default: https://1.1.1.1/dns-query).
-Security: Restricts access to the specified path and validates request methods and Content-Type.
-Compatibility: Works with older PHP versions (5.3+).
+DoH Query Handling: Processes DNS queries via GET or POST requests, compliant with RFC8484.
+Database Caching: Stores IPv4 and IPv6 records in MySQL, with caching based on a 1-hour TTL (3600 seconds).
+Manual Domain Updates: Updates existing records for a specified domain using GET /dns_update.php?domain=example.com.
+Production-Ready: Optimized for production with minimal logging and no debug output.
+Compatibility: Supports PHP 5.6 and MySQL 8.0, using charset=utf8 to avoid compatibility issues.
 
-Requirements
+Prerequisites
 
-Web server (e.g., Apache, Nginx) with PHP support.
-PHP 5.3 or higher with the cURL extension enabled.
-HTTPS-enabled server (required for RFC8484 compliance).
-Write permissions for the web server user in the deployment directory.
+PHP: Version 5.6 (Note: PHP 5.6 is end-of-life; consider upgrading to PHP 7.4 or 8.x for security and compatibility).
+MySQL: Version 8.0 or compatible, with a user configured for mysql_native_password authentication.
+Web Server: Nginx or Apache with HTTPS enabled (TLS certificate required).
+PHP Extensions: pdo_mysql, curl, and openssl must be enabled.
+File Permissions: Web server must have read access to the PHP script and write access to the error log path.
 
 Installation
 
-Clone or Download the Repository:
-git clone <repository-url> /path/to/your/project
+Clone or Copy the Code:
 
-Or download and extract the project files.
-
-
-
-
-Configure PHP:
-
-Verify the cURL extension is enabled:php -m | grep curl
-
-
-If open_basedir is enabled in php.ini, ensure the document root is included or disable it for testing:open_basedir = none
-
-
-Restart the web server after changes:systemctl restart httpd  # or apache2
+Copy dns_update.php to your web server directory (e.g., /www/wwwroot/dns_update.php).
+Set file permissions to 644:chmod 644 /www/wwwroot/dns_update.php
 
 
 
 
-Verify HTTPS:
+Configure MySQL Database:
 
-Ensure your server has a valid SSL/TLS certificate (e.g., via Let's Encrypt).
-Test HTTPS access: https://your-domain.com/doh.php.
+Create a database (e.g., m6760_dnsphp) and two tables: dns_records_ipv4 and dns_records_ipv6.
+Table schema:CREATE TABLE dns_records_ipv4 (
+    domain VARCHAR(255) NOT NULL PRIMARY KEY,
+    ipv4 VARCHAR(45) NOT NULL,
+    timestamp BIGINT NOT NULL
+);
+CREATE TABLE dns_records_ipv6 (
+    domain VARCHAR(255) NOT NULL PRIMARY KEY,
+    ipv6 VARCHAR(45) NOT NULL,
+    timestamp BIGINT NOT NULL
+);
+
+
+Insert initial records for domains you want to cache (the script does not add new records).
+Configure the MySQL user with mysql_native_password to ensure PHP 5.6 compatibility:ALTER USER 'm6760_dnsphp'@'%' IDENTIFIED WITH mysql_native_password BY 'passwd';
 
 
 
-Configuration
-Edit doh.php to customize settings:
 
-Upstream DNS: Change UPSTREAM_DNS to another DoH server (e.g., https://dns.google/dns-query).define('UPSTREAM_DNS', 'https://dns.google/dns-query');
+Configure Web Server:
+
+Ensure HTTPS is enabled (the script enforces HTTPS).
+Example Nginx configuration:server {
+    listen 443 ssl;
+    server_name yourdomain.com;
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    root /www/wwwroot;
+    location /dns_update.php {
+        fastcgi_pass unix:/var/run/php-cgi-56.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
 
 
-Path: The endpoint is fixed at /doh.php. Modify DOH_PATH if you rename the file.define('DOH_PATH', '/doh.php');
+Restart the web server after configuration.
+
+
+Configure PHP Error Logging:
+
+Edit php.ini to set the error log path:error_log = /var/log/php_errors.log
+
+
+Ensure the web server has write access to the log file:touch /var/log/php_errors.log
+chmod 664 /var/log/php_errors.log
+chown www-data:www-data /var/log/php_errors.log
+
+
 
 
 
 Usage
-Testing with cURL
+Manual Domain Update
 
-GET Request:Send a base64url-encoded DNS query (e.g., for www.example.com A record):
-curl -v -H "Accept: application/dns-message" "https://your-domain.com/doh.php?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+Update a specific domain's IPv4 and/or IPv6 records:GET https://yourdomain.com/dns_update.php?domain=google.com
 
-Expected response:
-HTTP/1.1 200 OK
+
+Response: A plain text message (e.g., Domain update triggered for: google.com).
+The script checks if the domain exists in dns_records_ipv4 or dns_records_ipv6, queries Google DoH for A and AAAA records, and updates the corresponding ipv4 or ipv6 and timestamp fields.
+
+DNS Query
+
+Perform a DoH query via GET or POST:
+GET:GET https://yourdomain.com/dns_update.php?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB
+
+
+POST:POST https://yourdomain.com/dns_update.php
 Content-Type: application/dns-message
-Cache-Control: no-cache, no-store, must-revalidate
-Content-Length: <length>
-<binary DNS response>
+Body: <binary DNS query>
 
 
-POST Request:Send a binary DNS query:
-curl -v -X POST -H "Content-Type: application/dns-message" -H "Accept: application/dns-message" --data-binary @dns_query.bin "https://your-domain.com/doh.php"
-
-(Replace dns_query.bin with a file containing a binary DNS query.)
 
 
-Using with DoH Clients
-Configure a DoH-compatible client (e.g., Firefox, Cloudflare's 1.1.1.1 app) to use https://your-domain.com/doh.php as the DoH endpoint.
-Debugging
+The script checks the database for cached records. If the cache is valid (timestamp within 1 hour), it returns the cached response. Otherwise, it queries Google DoH and updates existing records.
 
-Check Script Execution:
-Look for the X-DOH-Debug: Script-Executed header in cURL responses.
-Check X-DOH-Request-URI to verify the requested path.
+Database Schema
 
-
-PHP Errors:
-Temporarily enable error display in doh.php:ini_set('display_errors', 1);
-error_reporting(E_ALL);
+dns_records_ipv4:
+domain (VARCHAR(255), PRIMARY KEY): Domain name (e.g., google.com).
+ipv4 (VARCHAR(45)): IPv4 address (e.g., 142.250.190.14).
+timestamp (BIGINT): Unix timestamp of the last update.
 
 
-Check logs: /var/log/httpd/error_log or /var/log/php_errors.log.
+dns_records_ipv6:
+domain (VARCHAR(255), PRIMARY KEY): Domain name (e.g., google.com).
+ipv6 (VARCHAR(45)): IPv6 address (e.g., 2607:f8b0:4004:80a::200e).
+timestamp (BIGINT): Unix timestamp of the last update.
 
 
-Test Upstream DNS:curl -v -H "Accept: application/dns-message" "https://1.1.1.1/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+
+Note: The script only updates existing records. Pre-populate the tables with the domains you want to manage.
+Notes
+
+PHP 5.6 Compatibility: The script is designed for PHP 5.6 due to existing environment constraints. PHP 5.6 is end-of-life and may have security risks. Upgrade to PHP 7.4 or 8.x if possible.
+MySQL 8.0 Compatibility: Uses charset=utf8 to avoid charset (255) unknown errors. If MySQL uses caching_sha2_password, configure the user with mysql_native_password:ALTER USER 'm6760_dnsphp'@'%' IDENTIFIED WITH mysql_native_password BY 'passwd';
 
 
-Verify PHP:Create test.php with <?php phpinfo(); ?> and access https://your-domain.com/test.php.
+SSL Requirement: The script enforces HTTPS. Ensure your web server has a valid TLS certificate.
+Security:
+Avoid hardcoding DB_PASS. Use environment variables or a secure configuration file.
+Restrict access to dns_update.php using web server rules (e.g., Nginx allow/deny).
+
+
+Error Logging: Monitor /var/log/php_errors.log for database connection issues, upstream DNS errors, or update failures.
 
 Troubleshooting
 
-404 Not Found:
-Verify doh.php exists at /www/wwwroot/your-domain/doh.php.
-Check Apache’s document root and .htaccess rules.
+Database Connection Errors:
+Check DB_HOST, DB_USER, DB_PASS, and DB_NAME in dns_update.php.
+Verify MySQL user authentication (mysql_native_password).
+Ensure the MySQL server allows non-SSL connections if needed.
 
 
-cURL Errors:
-If open_basedir restricts cURL, adjust php.ini or ensure the document root is allowed.
+Upstream DNS Errors:
+Confirm https://dns.google/dns-query is accessible and not blocked.
+Check cURL and OpenSSL extensions in PHP.
 
 
-Content-Type: text/html:
-Indicates PHP isn’t executing. Confirm .php files are handled by PHP in Apache config:<FilesMatch \.php$>
-    SetHandler application/x-httpd-php
-</FilesMatch>
-
-
+No Updates Performed:
+Ensure the domain exists in dns_records_ipv4 or dns_records_ipv6.
+Verify the domain format is valid (e.g., google.com, not http://google.com).
 
 
 
-Limitations
-
-Designed for basic DoH forwarding; lacks advanced features like caching or rate limiting.
-Tested with PHP 5.3+ and Apache; other environments may require adjustments.
-Older cURL versions (e.g., 7.29.0) may produce warnings but should work.
-
-Contributing
-Contributions are welcome! Submit issues or pull requests to improve functionality or compatibility.
 License
-This project is licensed under the MIT License.
+MIT License. See LICENSE for details.
+Contact
+For issues or feature requests, contact the administrator or open an issue in the repository.
