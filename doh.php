@@ -1,246 +1,225 @@
 <?php
-#PHP 7.0 +
 
-define('UPSTREAM_DNS', 'https://dns.google/dns-query'); // 上游DNS服务器（Google DoH）
-$ALLOWED_METHODS = array('GET', 'POST'); // 支持的方法
+define('UPSTREAM_DNS', 'https://dns.google/dns-query');
 
-// MySQL数据库配置
+// ==================== 配置 ====================
 define('DB_HOST', 'localhost');
 define('DB_USER', 'your_username');
 define('DB_PASS', 'your_password');
 define('DB_NAME', 'dns_cache');
 
-define('DB_TABLE_IPV4', 'dns_records_ipv4');
-define('DB_TABLE_IPV6', 'dns_records_ipv6');
-
-// 确保使用HTTPS
-if (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on') {
-    header('HTTP/1.1 403 Forbidden');
-    exit('HTTPS is required for DoH');
+// ==================== 基础检查 ====================
+if (empty($_SERVER['HTTPS']) || $_SERVER['HTTPS'] === 'off') {
+    header('HTTP/1.1 403 Forbidden'); exit('HTTPS required');
+}
+$script = basename($_SERVER['SCRIPT_NAME']);
+$path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '';
+if ($path !== '/' . $script && !str_ends_with($path, '/' . $script)) {
+    header('HTTP/1.1 404 Not Found'); exit;
 }
 
-// 获取当前脚本文件名
-$script_name = basename($_SERVER['SCRIPT_NAME']);
-$request_uri = $_SERVER['REQUEST_URI'];
-$uri_path = parse_url($request_uri, PHP_URL_PATH);
-
-// 检查请求路径是否匹配当前脚本文件名
-if ($uri_path !== '/' . $script_name && substr($uri_path, -strlen($script_name) - 1) !== '/' . $script_name) {
-    header('HTTP/1.1 404 Not Found');
-    exit('404 Not Found');
-}
-
-// 检查请求方法
-if (!in_array($_SERVER['REQUEST_METHOD'], $ALLOWED_METHODS)) {
-    header('HTTP/1.1 405 Method Not Allowed');
-    header('Allow: GET, POST');
-    exit('Method Not Allowed');
-}
-
-// 处理DNS查询
-$dns_query = null;
-$content_type = isset($_SERVER['CONTENT_TYPE']) ? $_SERVER['CONTENT_TYPE'] : 'application/dns-message';
-
+// ==================== 获取查询 ====================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // POST请求：检查Content-Type并获取DNS查询数据
-    if ($content_type !== 'application/dns-message') {
-        header('HTTP/1.1 415 Unsupported Media Type');
-        exit('Unsupported Media Type');
+    if (($_SERVER['CONTENT_TYPE'] ?? '') !== 'application/dns-message') {
+        header('HTTP/1.1 415 Unsupported Media Type'); exit;
     }
     $dns_query = file_get_contents('php://input');
-} elseif ($_SERVER['REQUEST_METHOD'] === 'GET') {
-    // GET请求：从dns参数获取base64url编码的DNS消息
+} else {
     if (!isset($_GET['dns'])) {
-        header('HTTP/1.1 400 Bad Request');
-        exit('Missing dns parameter');
+        header('HTTP/1.1 400 Bad Request'); exit('Missing dns parameter');
     }
-    // base64url解码
-    $dns_query = base64_decode(str_replace(array('-', '_'), array('+', '/'), $_GET['dns']));
+    $dns_query = base64_decode(strtr($_GET['dns'], '-_', '+/'), true);
+}
+if (!$dns_query) {
+    header('HTTP/1.1 400 Bad Request'); exit('Invalid query');
 }
 
-if (empty($dns_query) || $dns_query === false) {
-    header('HTTP/1.1 400 Bad Request');
-    exit('Empty or Invalid DNS Query');
-}
-
-// 连接到 MySQL 8.0 数据库
-try {
-    $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8';
-    $pdo = new PDO($dsn, DB_USER, DB_PASS, array(
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-    ));
-    $pdo->exec('SET SESSION sql_mode = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"');
-} catch (PDOException $e) {
-    error_log('Database Connection Failed: ' . $e->getMessage());
-    header('HTTP/1.1 500 Internal Server Error');
-    exit('Database Connection Failed');
-}
-
-// 从DNS查询数据中提取域名和查询类型
+// ==================== 解析域名 ====================
 $domain = '';
-$pos = 12; // 跳过DNS头部（12字节）
-$domain_parts = array();
-while ($pos < strlen($dns_query) && ord($dns_query[$pos]) !== 0) {
-    $len = ord($dns_query[$pos]);
+$pos = 12;
+while ($pos < strlen($dns_query) && ($len = ord($dns_query[$pos])) !== 0) {
     $pos++;
-    if ($len > 0) {
-        $domain_parts[] = substr($dns_query, $pos, $len);
-        $pos += $len;
-    }
+    if ($len) $domain .= substr($dns_query, $pos, $len) . '.';
+    $pos += $len;
 }
-$domain = implode('.', $domain_parts);
-$qtype = unpack('n', substr($dns_query, $pos + 2, 2))[1]; // 查询类型（1=A, 28=AAAA）
+$domain = rtrim($domain, '.');
+$qtype  = unpack('n', substr($dns_query, $pos + 2, 2))[1];
 
-// 检查数据库中是否有DNS记录
-$ips = array('ipv4' => null, 'ipv6' => null);
-
-// 查询IPv4
-if ($qtype == 1 || $qtype == 255) { // A记录或ANY
-    $stmt = $pdo->prepare('SELECT ipv4 FROM ' . DB_TABLE_IPV4 . ' WHERE domain = ?');
-    $stmt->execute(array($domain));
-    $cached = $stmt->fetch();
-    if ($cached) {
-        $ips['ipv4'] = $cached['ipv4'];
-    }
+// ==================== 数据库连接 ====================
+try {
+    $pdo = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT => 3
+    ]);
+} catch (Throwable $e) {
+    header('HTTP/1.1 503 Database Error'); exit;
 }
 
-// 查询IPv6
-if ($qtype == 28 || $qtype == 255) { // AAAA记录或ANY
-    $stmt = $pdo->prepare('SELECT ipv6 FROM ' . DB_TABLE_IPV6 . ' WHERE domain = ?');
-    $stmt->execute(array($domain));
-    $cached = $stmt->fetch();
-    if ($cached) {
-        $ips['ipv6'] = $cached['ipv6'];
-    }
+// ==================== 1. 优先查缓存（有就直接返回，绝不继续执行）===================
+$ipv4 = $ipv6 = null;
+
+if (in_array($qtype, [1, 255])) {
+    $stmt = $pdo->prepare("SELECT ipv4 FROM dns_records_ipv4 WHERE domain = ?");
+    $stmt->execute([$domain]);
+    if ($row = $stmt->fetch()) $ipv4 = $row['ipv4'];
+}
+if (in_array($qtype, [28, 255])) {
+    $stmt = $pdo->prepare("SELECT ipv6 FROM dns_records_ipv6 WHERE domain = ?");
+    $stmt->execute([$domain]);
+    if ($row = $stmt->fetch()) $ipv6 = $row['ipv6'];
 }
 
-// 缓存命中：构建DNS响应
-if ($ips['ipv4'] || $ips['ipv6']) {
-    $response = $dns_query; // 复制查询头部
-    $response[2] = "\x81\x80"; // 设置响应标志（QR=1）
-    $answer_count = ($ips['ipv4'] ? 1 : 0) + ($ips['ipv6'] ? 1 : 0);
-    $response[6] = pack('n', $answer_count); // Answer RRs
-    $response[8] = "\x00\x00"; // Authority RRs = 0
-    $response[10] = "\x00\x00"; // Additional RRs = 0
+// 缓存命中 → 直接返回，彻底结束脚本！！
+if ($ipv4 !== null || $ipv6 !== null) {
+    $resp = $dns_query;
+    $resp[2] = "\x81\x80"; // QR=1, AA=1
+    $ancount = ($ipv4 ? 1 : 0) + ($ipv6 ? 1 : 0);
+    substr_replace($resp, pack('n', $ancount), 6, 2);
     $answer = '';
-    if ($ips['ipv4']) {
-        $answer .= "\xc0\x0c"; // 指向查询中的域名
-        $answer .= "\x00\x01"; // 类型 A
-        $answer .= "\x00\x01"; // 类 IN
-        $answer .= "\x00\x00\x0e\x10"; // TTL 3600秒
-        $answer .= "\x00\x04"; // 数据长度 4字节
-        $answer .= inet_pton($ips['ipv4']); // IPv4地址
-    }
-    if ($ips['ipv6']) {
-        $answer .= "\xc0\x0c"; // 指向查询中的域名
-        $answer .= "\x00\x1c"; // 类型 AAAA
-        $answer .= "\x00\x01"; // 类 IN
-        $answer .= "\x00\x00\x0e\x10"; // TTL 3600秒
-        $answer .= "\x00\x10"; // 数据长度 16字节
-        $answer .= inet_pton($ips['ipv6']); // IPv6地址
-    }
-    $response .= $answer;
+    if ($ipv4) $answer .= "\xc0\x0c\x00\x01\x00\x01\x00\x00\x0e\x10\x00\x04" . inet_pton($ipv4);
+    if ($ipv6) $answer .= "\xc0\x0c\x00\x1c\x00\x01\x00\x00\x0e\x10\x00\x10" . inet_pton($ipv6);
+    $resp .= $answer;
 
     header('Content-Type: application/dns-message');
-    header('Cache-Control: no-cache, no-store, must-revalidate');
-    header('Content-Length: ' . strlen($response));
-    echo $response;
+    header('Cache-Control: no-store');
+    echo $resp;
+    exit; // 必须 exit！！
+}
+
+// ==================== 2. 缓存未命中 → 才开始后续逻辑 ====================
+
+// 高并发防重锁
+$lock_file = sys_get_temp_dir() . '/doh_lock_' . hash('sha256', $domain);
+$lock_fp   = fopen($lock_file, 'w+');
+if (!flock($lock_fp, LOCK_EX)) {
+    // 拿不到锁 → 等待 3 秒后返回 SERVFAIL
+    sleep(3);
+    $fail = $dns_query;
+    $fail[2] = "\x81\x82"; // RCODE=2 SERVFAIL
+    header('Content-Type: application/dns-message');
+    echo $fail;
     exit;
 }
 
-// 初始化cURL查询上游DNS
-$ch = curl_init();
-curl_setopt_array($ch, array(
-    CURLOPT_URL => UPSTREAM_DNS,
-    CURLOPT_POST => 1,
-    CURLOPT_POSTFIELDS => $dns_query,
-    CURLOPT_RETURNTRANSFER => 1,
-    CURLOPT_HTTPHEADER => array(
-        'Content-Type: application/dns-message',
-        'Accept: application/dns-message'
-    ),
-    CURLOPT_TIMEOUT => 5,
-    CURLOPT_SSL_VERIFYPEER => 1,
-    CURLOPT_SSL_VERIFYHOST => 2,
-    CURLOPT_PROTOCOLS => CURLPROTO_HTTPS
-));
+// 再次检查（防止等待期间已有记录）
+$ipv4 = $ipv6 = null;
+if (in_array($qtype, [1, 255])) {
+    $stmt = $pdo->prepare("SELECT ipv4 FROM dns_records_ipv4 WHERE domain = ?");
+    $stmt->execute([$domain]);
+    if ($row = $stmt->fetch()) $ipv4 = $row['ipv4'];
+}
+if (in_array($qtype, [28, 255])) {
+    $stmt = $pdo->prepare("SELECT ipv6 FROM dns_records_ipv6 WHERE domain = ?");
+    $stmt->execute([$domain]);
+    if ($row = $stmt->fetch()) $ipv6 = $row['ipv6'];
+}
+if ($ipv4 !== null || $ipv6 !== null) {
+    flock($lock_fp, LOCK_UN); fclose($lock_fp); @unlink($lock_file);
+    // 直接返回缓存
+    $resp = $dns_query;
+    $resp[2] = "\x81\x80";
+    $ancount = ($ipv4 ? 1 : 0) + ($ipv6 ? 1 : 0);
+    substr_replace($resp, pack('n', $ancount), 6, 2);
+    $answer = '';
+    if ($ipv4) $answer .= "\xc0\x0c\x00\x01\x00\x01\x00\x00\x0e\x10\x00\x04" . inet_pton($ipv4);
+    if ($ipv6) $answer .= "\xc0\x0c\x00\x1c\x00\x01\x00\x00\x0e\x10\x00\x10" . inet_pton($ipv6);
+    $resp .= $answer;
+    header('Content-Type: application/dns-message');
+    echo $resp;
+    exit;
+}
 
-// 执行上游DNS请求
+// 尝试向上游查询
+$ch = curl_init(UPSTREAM_DNS);
+curl_setopt_array($ch, [
+    CURLOPT_POST           => true,
+    CURLOPT_POSTFIELDS     => $dns_query,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HTTPHEADER     => ['Content-Type: application/dns-message'],
+    CURLOPT_TIMEOUT        => 6,
+    CURLOPT_CONNECTTIMEOUT => 4,
+]);
 $response = curl_exec($ch);
 $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-// 处理上游DNS响应
-if ($response === false || $http_code !== 200) {
-    error_log('Upstream DNS Error for domain: ' . $domain . ', HTTP code: ' . $http_code);
-    header('HTTP/1.1 502 Bad Gateway');
-    exit('Upstream DNS Error');
+// 上游失败 → 返回 SERVFAIL
+if ($response === false || $http_code !== 200 || strlen($response) < 12) {
+    flock($lock_fp, LOCK_UN); fclose($lock_fp); @unlink($lock_file);
+    $fail = $dns_query;
+    $fail[2] = "\x81\x82"; // SERVFAIL
+    header('Content-Type: application/dns-message');
+    echo $fail;
+    exit;
 }
 
-// 解析DNS响应以提取IP地址（只取第一个A和AAAA记录）
-$ipv4 = null;
-$ipv6 = null;
-$offset = 12; // 跳过头部
-$offset += strlen($domain) + 2 + 4; // 跳过QNAME、QTYPE、QCLASS
-$answer_count = unpack('n', substr($response, 6, 2))[1]; // 获取答案数量
-if ($answer_count > 0) {
-    while ($offset < strlen($response)) {
-        if (ord($response[$offset]) >= 192) { // 压缩指针
-            $offset += 2;
-        } else {
-            while (ord($response[$offset]) !== 0) {
-                $offset += ord($response[$offset]) + 1;
-            }
-            $offset++;
-        }
-        $type = unpack('n', substr($response, $offset, 2))[1];
-        $offset += 4; // 跳过TYPE和CLASS
-        $ttl = unpack('N', substr($response, $offset, 4))[1];
-        $offset += 4;
-        $data_len = unpack('n', substr($response, $offset, 2))[1];
-        $offset += 2;
-        if ($type == 1 && $data_len == 4 && $ipv4 === null) { // A记录，IPv4
-            $ipv4 = inet_ntop(substr($response, $offset, 4));
-        } elseif ($type == 28 && $data_len == 16 && $ipv6 === null) { // AAAA记录，IPv6
-            $ipv6 = inet_ntop(substr($response, $offset, 16));
-        }
-        $offset += $data_len;
-        // 仅提取第一个IPv4和IPv6记录
-        if ($ipv4 !== null && $ipv6 !== null) {
-            break;
-        }
-    }
-}
-
-// 将DNS结果插入数据库（仅INSERT，不修改）
-try {
-    if ($ipv4 && $ips['ipv4'] === null) {
-        $stmt = $pdo->prepare('SELECT COUNT(*) FROM ' . DB_TABLE_IPV4 . ' WHERE domain = ?');
-        $stmt->execute(array($domain));
-        if ($stmt->fetchColumn() == 0) {
-            $stmt = $pdo->prepare('INSERT INTO ' . DB_TABLE_IPV4 . ' (domain, ipv4, timestamp) VALUES (?, ?, ?)');
-            $stmt->execute(array($domain, $ipv4, time()));
-        }
-    }
-    if ($ipv6 && $ips['ipv6'] === null) {
-        $stmt = $pdo->prepare('SELECT COUNT(*) FROM ' . DB_TABLE_IPV6 . ' WHERE domain = ?');
-        $stmt->execute(array($domain));
-        if ($stmt->fetchColumn() == 0) {
-            $stmt = $pdo->prepare('INSERT INTO ' . DB_TABLE_IPV6 . ' (domain, ipv6, timestamp) VALUES (?, ?, ?)');
-            $stmt->execute(array($domain, $ipv6, time()));
-        }
-    }
-} catch (PDOException $e) {
-    error_log('Failed to insert DNS response to database: ' . $e->getMessage());
-}
-
-// 设置响应头 (RFC8484)
+// 成功 → 立即返回给用户
 header('Content-Type: application/dns-message');
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Content-Length: ' . strlen($response));
-
-// 输出完整DNS响应
 echo $response;
+ob_flush(); flush();
+
+// 解析 IP 并异步写入（只写入一次）
+$ipv4_new = $ipv6_new = null;
+$offset = 12 + strlen($domain) + 6;
+$ancount = unpack('n', substr($response, 6, 2))[1];
+for ($i = 0; $i < $ancount && $offset < strlen($response); $i++) {
+    if (ord($response[$offset]) >= 192) $offset += 2;
+    else { while (ord($response[$offset])) $offset += ord($response[$offset]) + 1; $offset++; }
+    $type = unpack('n', substr($response, $offset, 2))[1];
+    $offset += 8;
+    $rdlen = unpack('n', substr($response, $offset, 2))[1];
+    $offset += 2;
+    if ($type == 1  && $rdlen == 4  && !$ipv4_new) $ipv4_new = inet_ntop(substr($response, $offset, 4));
+    if ($type == 28 && $rdlen == 16 && !$ipv6_new) $ipv6_new = inet_ntop(substr($response, $offset, 16));
+    $offset += $rdlen;
+}
+
+if ($ipv4_new || $ipv6_new) {
+    register_shutdown_function(function () use ($domain, $ipv4_new, $ipv6_new, $lock_file, $lock_fp) {
+        try {
+            $db = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+            ]);
+            $db->beginTransaction();
+
+            if ($ipv4_new) {
+                $stmt = $db->prepare("SELECT 1 FROM dns_records_ipv4 WHERE domain = ? LIMIT 1");
+                $stmt->execute([$domain]);
+                if ($stmt->fetch()) goto skip4;
+
+                $stmt = $db->query("SELECT id FROM dns_id_counter_v4 FOR UPDATE");
+                $cur = $stmt->fetchColumn();
+                $db->exec("UPDATE dns_id_counter_v4 SET id = id + 1");
+                $new_id = $cur + 1;
+                $db->prepare("INSERT INTO dns_records_ipv4 (id, domain, ipv4, timestamp) VALUES (?, ?, ?, ?)")
+                    ->execute([$new_id, $domain, $ipv4_new, time()]);
+                skip4:
+            }
+
+            if ($ipv6_new) {
+                $stmt = $db->prepare("SELECT 1 FROM dns_records_ipv6 WHERE domain = ? LIMIT 1");
+                $stmt->execute([$domain]);
+                if ($stmt->fetch()) goto skip6;
+
+                $stmt = $db->query("SELECT id FROM dns_id_counter_v6 FOR UPDATE");
+                $cur = $stmt->fetchColumn();
+                $db->exec("UPDATE dns_id_counter_v6 SET id = id + 1");
+                $new_id = $cur + 1;
+                $db->prepare("INSERT INTO dns_records_ipv6 (id, domain, ipv6, timestamp) VALUES (?, ?, ?, ?)")
+                    ->execute([$new_id, $domain, $ipv6_new, time()]);
+                skip6:
+            }
+
+            $db->commit();
+        } catch (Throwable $e) {
+            error_log("Write failed: " . $e->getMessage());
+        } finally {
+            if ($lock_fp) {
+                @flock($lock_fp, LOCK_UN);
+                @fclose($lock_fp);
+                @unlink($lock_file);
+            }
+        }
+    });
+}
 ?>
