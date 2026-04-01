@@ -1,0 +1,11 @@
+# 自定义域名解析（IP 在前，域名在后，可多行）
+192.168.1.10    printer.lan
+192.168.1.20    nas.home
+2001:db8::1     nas.home          # 支持 IPv6（同一域名可多 IP）
+192.168.1.100   yourtest.example.com
+
+# 也可以加注释或多域名一行
+192.168.1.50    dev.home lan.home
+
+2001:470:8935:9::2    translate.google.com
+2001:470:8935:9::2    translate-pa.googleapis.com
